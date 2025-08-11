@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BundleBot — Build My Bundle</title>
+  <meta name="description" content="Tell BundleBot what you need, get a money-saving product bundle." />
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="/favicon.png" />
+</head>
+<body>
+  <header class="wrap">
+    <img src="/logo.png" alt="BundleBot" class="logo" />
+    <h1>BundleBot</h1>
+    <p class="sub">Type what you need. We’ll return a curated bundle that saves you money.</p>
+  </header>
+
+  <main class="wrap card">
+    <form id="bundle-form">
+      <label for="prompt">What should we build?</label>
+      <textarea id="prompt" name="prompt" rows="5" placeholder="e.g., I'm a freshman at the University of Ohio, build me a dorm room setup under $500." required></textarea>
+
+      <label for="email">Email (so we can send your bundle)</label>
+      <input id="email" name="email" type="email" placeholder="you@email.com" required />
+
+      <button type="submit">Get My Bundle (Free Preview)</button>
+      <p class="helper">You’ll get a 3-item preview. Full bundle comes next.</p>
+    </form>
+
+    <section id="result" class="hidden">
+      <h2>Thanks! We’re building your bundle.</h2>
+      <p>Check your email soon. Want the full 10–12 item bundle? You’ll be able to upgrade after the preview.</p>
+    </section>
+  </main>
+
+  <footer class="wrap tiny">
+    <a href="/privacy.html">Privacy</a> · <a href="/terms.html">Terms</a>
+  </footer>
+
+  <script>
+    const form = document.getElementById('bundle-form');
+    const result = document.getElementById('result');
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      // Phase 1: store request locally so you can manually fulfill
+      const payload = {
+        prompt: form.prompt.value.trim(),
+        email: form.email.value.trim(),
+        ts: new Date().toISOString()
+      };
+      const existing = JSON.parse(localStorage.getItem('bundle_requests') || '[]');
+      existing.push(payload);
+      localStorage.setItem('bundle_requests', JSON.stringify(existing));
+
+      form.classList.add('hidden');
+      result.classList.remove('hidden');
+    });
+  </script>
+</body>
+</html>
