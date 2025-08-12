@@ -14,13 +14,13 @@
     button { background:#111; color:#fff; font-weight:700; cursor:pointer; }
     button:disabled { opacity:.6; cursor:not-allowed; }
     .hint { color:#666; font-size:.9rem; margin-top:6px; }
-    .status { margin-top:12px; color:#333; }
+    .status { margin-top:12px; color:#333; min-height: 1.2em; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>BundleBot</h1>
-    <p>Tell us what you need (budget, situation, style). We’ll build a money-saving bundle.</p>
+    <p>Tell us what you need (budget, who it’s for, any must-haves). We’ll build a money-saving bundle.</p>
 
     <div class="card">
       <form id="bundle-form">
@@ -28,7 +28,7 @@
         <textarea id="prompt" name="prompt" rows="5"
           placeholder="e.g., Build me a dorm room setup for a University of Connecticut freshman under $500."
           required></textarea>
-        <div class="hint">Tip: Include budget, who it’s for, and any must-haves.</div>
+        <div class="hint">Tip: include budget, audience, and must-haves.</div>
 
         <button type="submit" id="submit-btn">Get My Bundle</button>
         <div id="status" class="status"></div>
@@ -40,11 +40,16 @@
     const form = document.getElementById('bundle-form');
     const btn = document.getElementById('submit-btn');
     const statusEl = document.getElementById('status');
+    const promptEl = document.getElementById('prompt');
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const prompt = document.getElementById('prompt').value.trim();
-      if (!prompt) { statusEl.textContent = 'Please enter a request.'; return; }
+      const prompt = promptEl.value.trim();
+      if (!prompt) {
+        statusEl.textContent = 'Please enter a request.';
+        promptEl.focus();
+        return;
+      }
 
       btn.disabled = true;
       btn.textContent = 'Building your bundle…';
@@ -57,17 +62,17 @@
           body: JSON.stringify({ prompt })
         });
 
-        const data = await resp.json();
-        if (!resp.ok || !data || !data.items) {
-          throw new Error(data?.error || 'Unexpected response');
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data || !Array.isArray(data.items)) {
+          throw new Error(data?.error || 'Unexpected response from server.');
         }
 
-        // Save result for the results page and redirect
+        // Save for results page and navigate
         sessionStorage.setItem('bundle_data', JSON.stringify(data));
         window.location.href = '/results.html';
       } catch (err) {
         console.error(err);
-        statusEl.textContent = 'Sorry, something went wrong. Please try again.';
+        statusEl.textContent = 'Sorry—something went wrong. Please try again.';
       } finally {
         btn.disabled = false;
         btn.textContent = 'Get My Bundle';
