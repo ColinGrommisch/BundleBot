@@ -4,56 +4,74 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>BundleBot — Build My Bundle</title>
-  <meta name="description" content="Tell BundleBot what you need, get a money-saving product bundle." />
   <link rel="stylesheet" href="/styles.css" />
-  <link rel="icon" href="/favicon.png" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .wrap { max-width: 760px; margin: 0 auto; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; background: #fff; }
+    label { display:block; margin:12px 0 6px; }
+    textarea,input,button { width:100%; padding:12px; border-radius:10px; border:1px solid #ccc; }
+    button { background:#111; color:#fff; font-weight:700; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .hint { color:#666; font-size:.9rem; margin-top:6px; }
+    .status { margin-top:12px; color:#333; }
+  </style>
 </head>
 <body>
-  <header class="wrap">
-    <img src="/logo.png" alt="BundleBot" class="logo" />
+  <div class="wrap">
     <h1>BundleBot</h1>
-    <p class="sub">Type what you need. We’ll return a curated bundle that saves you money.</p>
-  </header>
+    <p>Tell us what you need (budget, situation, style). We’ll build a money-saving bundle.</p>
 
-  <main class="wrap card">
-    <form id="bundle-form">
-      <label for="prompt">What should we build?</label>
-      <textarea id="prompt" name="prompt" rows="5" placeholder="e.g., I'm a freshman at the University of Ohio, build me a dorm room setup under $500." required></textarea>
+    <div class="card">
+      <form id="bundle-form">
+        <label for="prompt">What should we build?</label>
+        <textarea id="prompt" name="prompt" rows="5"
+          placeholder="e.g., Build me a dorm room setup for a University of Connecticut freshman under $500."
+          required></textarea>
+        <div class="hint">Tip: Include budget, who it’s for, and any must-haves.</div>
 
-      <label for="email">Email (so we can send your bundle)</label>
-      <input id="email" name="email" type="email" placeholder="you@email.com" required />
-
-      <button type="submit">Get My Bundle (Free Preview)</button>
-      <p class="helper">You’ll get a 3-item preview. Full bundle comes next.</p>
-    </form>
-
-    <section id="result" class="hidden">
-      <h2>Thanks! We’re building your bundle.</h2>
-      <p>Check your email soon. Want the full 10–12 item bundle? You’ll be able to upgrade after the preview.</p>
-    </section>
-  </main>
-
-  <footer class="wrap tiny">
-    <a href="/privacy.html">Privacy</a> · <a href="/terms.html">Terms</a>
-  </footer>
+        <button type="submit" id="submit-btn">Get My Bundle</button>
+        <div id="status" class="status"></div>
+      </form>
+    </div>
+  </div>
 
   <script>
     const form = document.getElementById('bundle-form');
-    const result = document.getElementById('result');
-    form.addEventListener('submit', (e) => {
-      e.preventDefault();
-      // Phase 1: store request locally so you can manually fulfill
-      const payload = {
-        prompt: form.prompt.value.trim(),
-        email: form.email.value.trim(),
-        ts: new Date().toISOString()
-      };
-      const existing = JSON.parse(localStorage.getItem('bundle_requests') || '[]');
-      existing.push(payload);
-      localStorage.setItem('bundle_requests', JSON.stringify(existing));
+    const btn = document.getElementById('submit-btn');
+    const statusEl = document.getElementById('status');
 
-      form.classList.add('hidden');
-      result.classList.remove('hidden');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const prompt = document.getElementById('prompt').value.trim();
+      if (!prompt) { statusEl.textContent = 'Please enter a request.'; return; }
+
+      btn.disabled = true;
+      btn.textContent = 'Building your bundle…';
+      statusEl.textContent = '';
+
+      try {
+        const resp = await fetch('/api/build-bundle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt })
+        });
+
+        const data = await resp.json();
+        if (!resp.ok || !data || !data.items) {
+          throw new Error(data?.error || 'Unexpected response');
+        }
+
+        // Save result for the results page and redirect
+        sessionStorage.setItem('bundle_data', JSON.stringify(data));
+        window.location.href = '/results.html';
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'Sorry, something went wrong. Please try again.';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Get My Bundle';
+      }
     });
   </script>
 </body>
