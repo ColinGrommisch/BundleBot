@@ -4,33 +4,45 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BundleBot – Your Bundle</title>
-  <link rel="stylesheet" href="/styles.css" />
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 20px; }
     h1 { margin-bottom: 10px; }
     .totals { margin-bottom: 20px; font-weight: bold; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
     .card { border: 1px solid #ccc; border-radius: 8px; padding: 12px; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
     .card img { max-width: 100%; height: auto; border-radius: 4px; margin-bottom: 8px; }
-    .card h3 { margin: 0 0 6px 0; font-size: 1.1rem; }
+    .card h3 { margin: 0 0 6px 0; font-size: 1.05rem; }
     .card p { font-size: 0.9rem; margin: 0 0 8px 0; color: #555; }
-    .back-link { display: inline-block; margin-top: 20px; }
+    .back { display:inline-block; margin-top:20px; }
   </style>
 </head>
 <body>
   <h1>Your Curated Bundle</h1>
   <div id="totals" class="totals"></div>
   <div id="items" class="grid"></div>
-  <a href="/" class="back-link">← Back to start</a>
+  <a href="/" class="back">← Back</a>
 
   <script>
-    // Read bundle data from sessionStorage
     const data = JSON.parse(sessionStorage.getItem('bundle_data') || 'null');
+    const totals = document.getElementById('totals');
+    const items = document.getElementById('items');
 
-    const totalsDiv = document.getElementById('totals');
-    const itemsDiv = document.getElementById('items');
-
-    if (!data || !data.items || !data.items.length) {
-      totalsDiv.textContent = "No bundle found. Please go back and try again.";
+    if (!data?.items?.length) {
+      totals.textContent = 'No bundle found. Please go back and try again.';
     } else {
-      to
+      totals.textContent = `${data.title} • Budget: $${data.budget} • Total: $${data.total}`;
+      data.items.forEach(it => {
+        items.insertAdjacentHTML('beforeend', `
+          <div class="card">
+            <img src="${it.image}" alt="${it.name}">
+            <h3>${it.name}</h3>
+            <p>${it.reason}</p>
+            <p><strong>$${it.price}</strong></p>
+            <a href="${it.link}" target="_blank" rel="noopener noreferrer">View Product</a>
+          </div>
+        `);
+      });
+    }
+  </script>
+</body>
+</html>
