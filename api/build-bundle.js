@@ -1,12 +1,11 @@
 // api/build-bundle.js
 // Vercel Node serverless function (NOT Edge).
-// Debug-friendly version for RapidAPI "Real Time Product Search" (RPS).
-// - Reads { debug: true } to include non-sensitive debug info in response
-// - Logs URL and response shapes to Function Logs
-// - AI spec via OpenAI (optional; safe fallback)
-// - Product search via RapidAPI RPS (primary), optional Apify fallback
+// - AI spec via OpenAI (strict JSON) with safe fallback
+// - Product search via RapidAPI "Real Time Product Search" (RPS) primary
+// - Optional Apify fallback
 // - 45-min in-memory cache per category
-// - Budget-aware composer
+// - URL normalization to avoid ERR_NAME_NOT_RESOLVED
+// - Debug mode: send { debug:true } to get extra logs + debug block
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -33,11 +32,16 @@ export default async function handler(req, res) {
 
     const prompt   = String(body.prompt || '').trim();
     const budgetIn = Number(body.budget || NaN);
-    const debug    = Boolean(body.debug); // <-- turn on extra logs + debug block
+    const debug    = Boolean(body.debug); // enable extra logs + debug block
+
     if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
 
     // 1) AI → structured spec (safe fallback if OPENAI not set or fails)
-    const spec = await safeGetSpecFromAI({ prompt, budget: isFinite(budgetIn) ? budgetIn : undefined, debug });
+    const spec = await safeGetSpecFromAI({
+      prompt,
+      budget: isFinite(budgetIn) ? budgetIn : undefined,
+      debug
+    });
 
     // 2) Build candidates (cache-wrapped search per category)
     const candidates = await getCandidatesFromSpec(spec, debug);
@@ -85,6 +89,7 @@ You are BundleBot. Output STRICT JSON only:
 If user gives a budget, use it; else choose a reasonable one.
 Keep categories short: "bedding","lighting","storage","desk accessories","fan","laundry","bath","kitchen".
 `.trim();
+
     const user = `
 User request: "${prompt}"
 User budget: ${isFinite(budget) ? budget : 'N/A'}
@@ -102,6 +107,7 @@ Return exactly:
         messages: [{ role: 'system', content: system }, { role: 'user', content: user }]
       })
     });
+
     const text = await resp.text();
     if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${text}`);
 
@@ -170,7 +176,7 @@ async function searchProducts({ query, limit = 3, debug = false }) {
     });
     if (rapid?.length) return rapid;
 
-    // Uncomment this to *force* an error instead of falling back, for debugging:
+    // To force-visible errors in UI during debugging instead of falling back to demo, uncomment:
     // throw new Error('RapidAPI returned no items (forced for debugging)');
   }
 
@@ -183,7 +189,7 @@ async function searchProducts({ query, limit = 3, debug = false }) {
     if (apify?.length) return apify;
   }
 
-  // 3) Demo fallback
+  // 3) Demo fallback (never breaks UX)
   return [
     { name: `${capitalize(query)} — Option A`, price: 24.99, link: 'https://example.com/a', image: 'https://via.placeholder.com/300', reason: 'Good reviews • Low price', source: 'demo' },
     { name: `${capitalize(query)} — Option B`, price: 32.50, link: 'https://example.com/b', image: 'https://via.placeholder.com/300', reason: 'Solid quality • Popular pick', source: 'demo' },
@@ -242,8 +248,8 @@ async function rapidRPS({ query, limit, _debug = false }) {
   const items = rows.map((r) => {
     const name   = r.product_title || r.title || r.name || r.heading || 'Item';
     const price  = parsePrice(r.product_price || r.price || r.price_str || r.amount || '');
-    const link   = r.product_link || r.link || r.url || r.permalink || '#';
-    const image  = r.product_photo || r.image || r.thumbnail || r.imageUrl || 'https://via.placeholder.com/300';
+    const link   = toAbsoluteHttp(r.product_link || r.link || r.url || r.permalink) || '#';
+    const image  = toAbsoluteHttp(r.product_photo || r.image || r.thumbnail || r.imageUrl) || 'https://via.placeholder.com/300';
     const rating = r.product_rating || r.rating || r.stars || '';
     const store  = r.product_source || r.source || r.store || r.seller || '';
     const reason = buildReason({ rating, merchant: store });
@@ -284,8 +290,8 @@ async function apifyRetailSearch({ query, limit }) {
       const items = (Array.isArray(arr) ? arr : []).map((r) => {
         const name   = r.title || r.name || 'Item';
         const price  = parsePrice(r.price || r.extracted_price || r.price_str || '');
-        const link   = r.link || r.url || '#';
-        const image  = r.image || r.thumbnail || 'https://via.placeholder.com/300';
+        const link   = toAbsoluteHttp(r.link || r.url) || '#';
+        const image  = toAbsoluteHttp(r.image || r.thumbnail) || 'https://via.placeholder.com/300';
         const rating = r.rating || r.stars || '';
         const store  = r.store || r.source || '';
         const reason = buildReason({ rating, merchant: store });
@@ -338,7 +344,20 @@ function composeBundle({ spec, candidates }) {
   };
 }
 
-/** ---------------- Utils ---------------- */
+/** ---------------- URL Normalizer + other utils ---------------- */
+function toAbsoluteHttp(u) {
+  if (!u) return null;
+  if (typeof u !== 'string') u = String(u || '');
+  u = u.trim();
+  if (!u) return null;
+  if (u.startsWith('//')) return 'https:' + u;                       // protocol-relative -> https
+  if (/^https?:\/\//i.test(u)) return u;                             // absolute http(s)
+  if (u.startsWith('data:')) return u;                               // allow data URIs
+  // bare domain? prefix https
+  if (/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}([/:].*)?$/.test(u)) return 'https://' + u;
+  return null;                                                       // reject strange/relative paths
+}
+
 function parsePrice(p){ if (typeof p==='number') return p; const s=String(p||'').replace(/[, ]/g,''); const m=s.match(/(\d+(\.\d+)?)/); return m?Number(m[1]):NaN; }
 function buildReason({ rating, merchant }){ const parts=[]; if(merchant) parts.push(String(merchant)); if(rating) parts.push(`Rating: ${rating}`); return parts.length?parts.join(' • '):'Good value'; }
 function wait(ms){ return new Promise(r=>setTimeout(r,ms)); }
