@@ -7,13 +7,15 @@
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 20px; }
     h1 { margin-bottom: 10px; }
-    .totals { margin-bottom: 20px; font-weight: bold; }
+    .totals { margin-bottom: 20px; font-weight: 600; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
-    .card { border: 1px solid #ccc; border-radius: 8px; padding: 12px; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    .card img { max-width: 100%; height: auto; border-radius: 4px; margin-bottom: 8px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+    .card img { width: 100%; height: auto; border-radius: 6px; margin-bottom: 8px; }
     .card h3 { margin: 0 0 6px 0; font-size: 1.05rem; }
-    .card p { font-size: 0.9rem; margin: 0 0 8px 0; color: #555; }
+    .meta { color: #666; font-size: .9rem; margin: 0 0 8px 0; }
+    .price { font-weight: 700; margin: 0 0 8px 0; }
     .back { display:inline-block; margin-top:20px; }
+    .source { font-size: .8rem; color: #777; margin-left: 6px; }
   </style>
 </head>
 <body>
@@ -23,22 +25,45 @@
   <a href="/" class="back">← Back</a>
 
   <script>
+    // Sanitize URLs so broken/malformed hosts don't crash
+    function safeUrl(u) {
+      try {
+        if (!u) return null;
+        if (typeof u !== 'string') u = String(u || '');
+        u = u.trim();
+        if (!u) return null;
+        if (u.startsWith('//')) return 'https:' + u;               // protocol-relative -> https
+        if (/^https?:\/\//i.test(u)) return u;                      // absolute http(s)
+        if (u.startsWith('data:')) return u;                        // allow data: URIs
+        // bare domain? prefix https
+        if (/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}([/:].*)?$/.test(u)) return 'https://' + u;
+        return null;                                                // anything else: reject
+      } catch {
+        return null;
+      }
+    }
+
     const data = JSON.parse(sessionStorage.getItem('bundle_data') || 'null');
     const totals = document.getElementById('totals');
-    const items = document.getElementById('items');
+    const itemsDiv = document.getElementById('items');
 
     if (!data?.items?.length) {
       totals.textContent = 'No bundle found. Please go back and try again.';
     } else {
-      totals.textContent = `${data.title} • Budget: $${data.budget} • Total: $${data.total}`;
+      const fmt = (n) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(Number(n || 0));
+      totals.textContent = `${data.title} • Budget: ${fmt(data.budget)} • Total: ${fmt(data.total)} • Items: ${data.items.length}`;
+
       data.items.forEach(it => {
-        items.insertAdjacentHTML('beforeend', `
+        const img = safeUrl(it.image) || 'https://via.placeholder.com/300';
+        const href = safeUrl(it.link) || '#';
+        itemsDiv.insertAdjacentHTML('beforeend', `
           <div class="card">
-            <img src="${it.image}" alt="${it.name}">
+            <img src="${img}" alt="${it.name}" loading="lazy"
+                 onerror="this.onerror=null; this.src='https://via.placeholder.com/300';" />
             <h3>${it.name}</h3>
-            <p>${it.reason}</p>
-            <p><strong>$${it.price}</strong></p>
-            <a href="${it.link}" target="_blank" rel="noopener noreferrer">View Product</a>
+            <p class="meta">${it.reason || ''}<span class="source">${it.source ? `· ${it.source}` : ''}</span></p>
+            <p class="price">$${Number(it.price || 0).toFixed(2)}</p>
+            <a href="${href}" target="_blank" rel="noopener noreferrer">View Product</a>
           </div>
         `);
       });
