@@ -1,17 +1,16 @@
 // api/build-bundle.js
 // Vercel Node serverless function (NOT Edge).
 // - AI spec via OpenAI (strict JSON) with safe fallback
-// - Product search via RapidAPI Google Shopping (primary)
+// - Product search via RapidAPI "Real Time Product Search" (primary)
 // - Optional Apify fallback
 // - 45-min in-memory cache for product queries
-// - Budget-aware composer
-// - Always returns SOMETHING (demo fallback) so UI doesn't break
+// - Budget-aware composer (must-haves first, then cheapest)
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 const RAPIDAPI_KEY   = process.env.RAPIDAPI_KEY;
-const RAPIDAPI_HOST  = process.env.RAPIDAPI_HOST; // e.g. "google-shopping-results.p.rapidapi.com"
+const RAPIDAPI_HOST  = process.env.RAPIDAPI_HOST; // real-time-product-search.p.rapidapi.com
 
 const APIFY_TOKEN    = process.env.APIFY_TOKEN;    // optional
 const APIFY_ACTOR_ID = process.env.APIFY_ACTOR_ID; // optional
@@ -19,15 +18,14 @@ const APIFY_ACTOR_ID = process.env.APIFY_ACTOR_ID; // optional
 /** ---------------- In-memory cache ---------------- */
 const CACHE  = new Map();           // key -> { ts, data }
 const TTL_MS = 45 * 60 * 1000;      // 45 minutes
-function getCache(key){ const v = CACHE.get(key); return v && (Date.now()-v.ts<TTL_MS) ? v.data : null; }
-function setCache(key,data){ CACHE.set(key,{ ts:Date.now(), data }); }
+function getCache(k){ const v=CACHE.get(k); return v && (Date.now()-v.ts<TTL_MS) ? v.data : null; }
+function setCache(k,d){ CACHE.set(k,{ ts:Date.now(), data:d }); }
 
 /** ---------------- Main handler ---------------- */
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-
   try {
-    const raw  = req.body || '{}';
+    const raw = req.body || '{}';
     const body = typeof raw === 'string' ? JSON.parse(raw) : raw;
     const prompt   = String(body.prompt || '').trim();
     const budgetIn = Number(body.budget || NaN);
@@ -36,7 +34,7 @@ export default async function handler(req, res) {
     // 1) AI → structured spec (safe)
     const spec = await safeGetSpecFromAI({ prompt, budget: isFinite(budgetIn) ? budgetIn : undefined });
 
-    // 2) Build candidates from spec (search with cache wrap)
+    // 2) Candidates (cache-wrapped search per category)
     const candidates = await getCandidatesFromSpec(spec);
 
     // 3) Compose bundle
@@ -45,7 +43,7 @@ export default async function handler(req, res) {
     return res.status(200).json(bundle);
   } catch (err) {
     console.error('API error:', err);
-    // Final fallback so the UI still shows something
+    // Always return something to keep UX working
     const items = [
       { name:'Twin XL Bedding Set', price:79.99, link:'https://example.com/bedding', image:'https://via.placeholder.com/300', reason:'Fits dorm beds; reviewed well', source:'fallback' },
       { name:'LED Desk Lamp',       price:24.99, link:'https://example.com/lamp',    image:'https://via.placeholder.com/300', reason:'Dimmable + USB',               source:'fallback' },
@@ -66,14 +64,12 @@ export default async function handler(req, res) {
 async function safeGetSpecFromAI({ prompt, budget }) {
   try {
     if (!OPENAI_API_KEY) throw new Error('No OPENAI_API_KEY set');
-
     const system = `
 You are BundleBot. Output STRICT JSON only:
 { "title": string, "budget": number, "must_have": string[], "nice_to_have": string[], "max_items": number }
 If user gives a budget, use it; else choose a reasonable one.
 Keep categories short: "bedding","lighting","storage","desk accessories","fan","laundry","bath","kitchen".
 `.trim();
-
     const user = `
 User request: "${prompt}"
 User budget: ${isFinite(budget) ? budget : 'N/A'}
@@ -83,33 +79,24 @@ Return exactly:
 
     const resp = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: OPENAI_MODEL,
         temperature: 0.2,
         response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user',   content: user }
-        ]
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }]
       })
     });
-
     if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${await resp.text().catch(()=>resp.statusText)}`);
     const data = await resp.json();
     const raw  = data?.choices?.[0]?.message?.content || '{}';
 
     let spec = JSON.parse(raw);
-    // normalize
     spec.title        = stringOr(spec.title, `Bundle for: ${prompt}`);
-    spec.budget       = numberOr(spec.budget, isFinite(budget) ? budget : 500);
+    spec.budget       = clamp(numberOr(spec.budget, isFinite(budget) ? budget : 500), 50, 5000);
     spec.max_items    = clamp(numberOr(spec.max_items, 10), 3, 15);
     spec.must_have    = arrayOfStringsOr(spec.must_have,    ['bedding','lighting','storage']).slice(0, 10);
     spec.nice_to_have = arrayOfStringsOr(spec.nice_to_have, ['desk accessories','fan','laundry']).slice(0, 10);
-    spec.budget       = clamp(spec.budget, 50, 5000);
     return spec;
   } catch (e) {
     console.warn('AI spec fallback:', e?.message || e);
@@ -126,15 +113,15 @@ Return exactly:
 /** ---------------- Step 2: Candidates from spec (cache-wrapped search) ---------------- */
 async function getCandidatesFromSpec(spec) {
   const cats = [...(spec.must_have || []), ...(spec.nice_to_have || [])];
-  const uniqueCats = [...new Set(cats)].slice(0, 8); // keep small for MVP
+  const uniqueCats = [...new Set(cats)].slice(0, 8);
 
   const results = [];
   for (const cat of uniqueCats) {
-    const cacheKey = `q:${cat.toLowerCase()}|l:3`;
-    let items = getCache(cacheKey);
+    const key = `q:${cat.toLowerCase()}|l:3`;
+    let items = getCache(key);
     if (!items) {
       items = await searchProducts({ query: cat, limit: 3 }).catch(() => []);
-      if (items?.length) setCache(cacheKey, items);
+      if (items?.length) setCache(key, items);
     }
     results.push(...(items || []).map(i => ({ ...i, category: cat })));
   }
@@ -146,17 +133,15 @@ const RAPIDAPI_ENABLED = () => !!(RAPIDAPI_KEY && RAPIDAPI_HOST);
 const APIFY_ENABLED    = () => !!(APIFY_TOKEN && APIFY_ACTOR_ID);
 
 async function searchProducts({ query, limit = 3 }) {
-  // 1) RapidAPI (primary)
   if (RAPIDAPI_ENABLED()) {
-    const rapid = await rapidApiGoogleShopping({ query, limit }).catch(() => null);
+    const rapid = await rapidRPS({ query, limit }).catch(() => null); // RPS = Real Time Product Search
     if (rapid?.length) return rapid;
   }
-  // 2) Apify fallback (optional)
   if (APIFY_ENABLED()) {
     const apify = await apifyRetailSearch({ query, limit }).catch(() => null);
     if (apify?.length) return apify;
   }
-  // 3) Demo fallback
+  // Demo fallback
   return [
     { name: `${capitalize(query)} — Option A`, price: 24.99, link: 'https://example.com/a', image: 'https://via.placeholder.com/300', reason: 'Good reviews • Low price', source: 'demo' },
     { name: `${capitalize(query)} — Option B`, price: 32.50, link: 'https://example.com/b', image: 'https://via.placeholder.com/300', reason: 'Solid quality • Popular pick', source: 'demo' },
@@ -164,13 +149,12 @@ async function searchProducts({ query, limit = 3 }) {
   ].slice(0, limit).sort((a,b)=>a.price-b.price);
 }
 
-/** RapidAPI Google Shopping: normalize to {name, price, link, image, reason, source} */
-async function rapidApiGoogleShopping({ query, limit }) {
+/** RapidAPI: Real Time Product Search → normalize from json.data[] */
+async function rapidRPS({ query, limit }) {
+  // Endpoint: GET https://real-time-product-search.p.rapidapi.com/search?q=<term>&country=us
   const url = new URL(`https://${RAPIDAPI_HOST}/search`);
   url.searchParams.set('q', query);
-  url.searchParams.set('gl', 'US');
-  url.searchParams.set('hl', 'en');
-  url.searchParams.set('num', String(Math.max(3, limit))); // if supported
+  url.searchParams.set('country', 'us');
 
   const resp = await fetch(url.toString(), {
     method: 'GET',
@@ -182,19 +166,20 @@ async function rapidApiGoogleShopping({ query, limit }) {
   if (!resp.ok) throw new Error(`RapidAPI ${resp.status}: ${await resp.text().catch(()=>resp.statusText)}`);
 
   const json = await resp.json();
-  const rows = json?.results || json?.shopping_results || json?.data || [];
+  const rows = Array.isArray(json?.data) ? json.data : [];
+
   const items = rows.map((r) => {
-    const name   = r.title || r.name || r.product_title || 'Item';
-    const price  = parsePrice(r.price || r.extracted_price || r.price_str || r.price_string || '');
-    const link   = r.link || r.product_link || r.url || '#';
-    const image  = r.thumbnail || r.image || r.image_link || 'https://via.placeholder.com/300';
-    const rating = r.rating || r.stars || r.reviews || '';
-    const store  = r.source || r.store || r.merchant || '';
+    const name   = r.product_title || r.title || r.name || 'Item';
+    const price  = parsePrice(r.product_price || r.price || '');
+    const link   = r.product_link || r.link || '#';
+    const image  = r.product_photo || r.image || r.thumbnail || 'https://via.placeholder.com/300';
+    const rating = r.product_rating || r.rating || '';
+    const store  = r.product_source || r.source || r.store || '';
     const reason = buildReason({ rating, merchant: store });
-    return { name, price, link, image, reason, source: 'rapidapi' };
+    return { name, price, link, image, reason, source: 'rapidapi:rps' };
   })
   .filter(i => isFinite(i.price) && i.link && i.name)
-  .sort((a, b) => a.price - b.price)
+  .sort((a,b)=>a.price-b.price)
   .slice(0, limit);
 
   return items;
