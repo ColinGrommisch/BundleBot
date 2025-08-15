@@ -1,10 +1,12 @@
 // api/build-bundle.js
 // Vercel Node serverless function (NOT Edge).
-// - AI spec via OpenAI (strict JSON) with safe fallback
-// - Product search via RapidAPI "Real Time Product Search" (primary)
-// - Optional Apify fallback
-// - 45-min in-memory cache for product queries
-// - Budget-aware composer (must-haves first, then cheapest)
+// Debug-friendly version for RapidAPI "Real Time Product Search" (RPS).
+// - Reads { debug: true } to include non-sensitive debug info in response
+// - Logs URL and response shapes to Function Logs
+// - AI spec via OpenAI (optional; safe fallback)
+// - Product search via RapidAPI RPS (primary), optional Apify fallback
+// - 45-min in-memory cache per category
+// - Budget-aware composer
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -24,21 +26,33 @@ function setCache(k,d){ CACHE.set(k,{ ts:Date.now(), data:d }); }
 /** ---------------- Main handler ---------------- */
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
   try {
-    const raw = req.body || '{}';
+    const raw  = req.body || '{}';
     const body = typeof raw === 'string' ? JSON.parse(raw) : raw;
+
     const prompt   = String(body.prompt || '').trim();
     const budgetIn = Number(body.budget || NaN);
+    const debug    = Boolean(body.debug); // <-- turn on extra logs + debug block
     if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
 
-    // 1) AI → structured spec (safe)
-    const spec = await safeGetSpecFromAI({ prompt, budget: isFinite(budgetIn) ? budgetIn : undefined });
+    // 1) AI → structured spec (safe fallback if OPENAI not set or fails)
+    const spec = await safeGetSpecFromAI({ prompt, budget: isFinite(budgetIn) ? budgetIn : undefined, debug });
 
-    // 2) Candidates (cache-wrapped search per category)
-    const candidates = await getCandidatesFromSpec(spec);
+    // 2) Build candidates (cache-wrapped search per category)
+    const candidates = await getCandidatesFromSpec(spec, debug);
 
     // 3) Compose bundle
     const bundle = composeBundle({ spec, candidates });
+
+    if (debug) {
+      bundle.debug = {
+        rapid_host: RAPIDAPI_HOST || null,
+        candidates_count: Array.isArray(candidates) ? candidates.length : null,
+        categories: [...new Set([...(spec.must_have||[]), ...(spec.nice_to_have||[])])],
+        spec
+      };
+    }
 
     return res.status(200).json(bundle);
   } catch (err) {
@@ -61,9 +75,10 @@ export default async function handler(req, res) {
 }
 
 /** ---------------- Step 1: AI prompt → strict JSON spec (safe) ---------------- */
-async function safeGetSpecFromAI({ prompt, budget }) {
+async function safeGetSpecFromAI({ prompt, budget, debug }) {
   try {
     if (!OPENAI_API_KEY) throw new Error('No OPENAI_API_KEY set');
+
     const system = `
 You are BundleBot. Output STRICT JSON only:
 { "title": string, "budget": number, "must_have": string[], "nice_to_have": string[], "max_items": number }
@@ -87,16 +102,23 @@ Return exactly:
         messages: [{ role: 'system', content: system }, { role: 'user', content: user }]
       })
     });
-    if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${await resp.text().catch(()=>resp.statusText)}`);
-    const data = await resp.json();
-    const raw  = data?.choices?.[0]?.message?.content || '{}';
+    const text = await resp.text();
+    if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${text}`);
 
-    let spec = JSON.parse(raw);
+    let json = {};
+    try { json = JSON.parse(text); } catch {}
+    const raw  = json?.choices?.[0]?.message?.content || '{}';
+
+    let spec = {};
+    try { spec = JSON.parse(raw); } catch {}
+    // normalize
     spec.title        = stringOr(spec.title, `Bundle for: ${prompt}`);
     spec.budget       = clamp(numberOr(spec.budget, isFinite(budget) ? budget : 500), 50, 5000);
     spec.max_items    = clamp(numberOr(spec.max_items, 10), 3, 15);
     spec.must_have    = arrayOfStringsOr(spec.must_have,    ['bedding','lighting','storage']).slice(0, 10);
     spec.nice_to_have = arrayOfStringsOr(spec.nice_to_have, ['desk accessories','fan','laundry']).slice(0, 10);
+
+    if (debug) console.log('[AI] spec:', spec);
     return spec;
   } catch (e) {
     console.warn('AI spec fallback:', e?.message || e);
@@ -111,7 +133,7 @@ Return exactly:
 }
 
 /** ---------------- Step 2: Candidates from spec (cache-wrapped search) ---------------- */
-async function getCandidatesFromSpec(spec) {
+async function getCandidatesFromSpec(spec, debug = false) {
   const cats = [...(spec.must_have || []), ...(spec.nice_to_have || [])];
   const uniqueCats = [...new Set(cats)].slice(0, 8);
 
@@ -120,11 +142,18 @@ async function getCandidatesFromSpec(spec) {
     const key = `q:${cat.toLowerCase()}|l:3`;
     let items = getCache(key);
     if (!items) {
-      items = await searchProducts({ query: cat, limit: 3 }).catch(() => []);
+      items = await searchProducts({ query: cat, limit: 3, debug }).catch((e) => {
+        console.warn('[searchProducts] error:', e?.message || e);
+        return [];
+      });
       if (items?.length) setCache(key, items);
+    } else if (debug) {
+      console.log('[cache] hit for', key, 'items:', items.length);
     }
     results.push(...(items || []).map(i => ({ ...i, category: cat })));
   }
+
+  if (debug) console.log('[candidates] total:', results.length);
   return results;
 }
 
@@ -132,29 +161,45 @@ async function getCandidatesFromSpec(spec) {
 const RAPIDAPI_ENABLED = () => !!(RAPIDAPI_KEY && RAPIDAPI_HOST);
 const APIFY_ENABLED    = () => !!(APIFY_TOKEN && APIFY_ACTOR_ID);
 
-async function searchProducts({ query, limit = 3 }) {
+async function searchProducts({ query, limit = 3, debug = false }) {
+  // 1) RapidAPI (primary)
   if (RAPIDAPI_ENABLED()) {
-    const rapid = await rapidRPS({ query, limit }).catch(() => null); // RPS = Real Time Product Search
+    const rapid = await rapidRPS({ query, limit, _debug: debug }).catch((e) => {
+      console.warn('[RPS] error:', e?.message || e);
+      return null;
+    });
     if (rapid?.length) return rapid;
+
+    // Uncomment this to *force* an error instead of falling back, for debugging:
+    // throw new Error('RapidAPI returned no items (forced for debugging)');
   }
+
+  // 2) Apify fallback (optional)
   if (APIFY_ENABLED()) {
-    const apify = await apifyRetailSearch({ query, limit }).catch(() => null);
+    const apify = await apifyRetailSearch({ query, limit }).catch((e) => {
+      console.warn('[Apify] error:', e?.message || e);
+      return null;
+    });
     if (apify?.length) return apify;
   }
-  // Demo fallback
+
+  // 3) Demo fallback
   return [
     { name: `${capitalize(query)} — Option A`, price: 24.99, link: 'https://example.com/a', image: 'https://via.placeholder.com/300', reason: 'Good reviews • Low price', source: 'demo' },
     { name: `${capitalize(query)} — Option B`, price: 32.50, link: 'https://example.com/b', image: 'https://via.placeholder.com/300', reason: 'Solid quality • Popular pick', source: 'demo' },
-    { name: `${capitalize(query)} — Option C`, price: 18.75, link: 'https://example.com/c', image: 'https://via.placeholder.com/300', reason: 'Cheapest viable option', source: 'demo' }
+    { name: `${capitalize(query)} — Option C`, price: 18.75, link: 'https://via.placeholder.com/300', image: 'https://via.placeholder.com/300', reason: 'Cheapest viable option', source: 'demo' }
   ].slice(0, limit).sort((a,b)=>a.price-b.price);
 }
 
-/** RapidAPI: Real Time Product Search → normalize from json.data[] */
-async function rapidRPS({ query, limit }) {
-  // Endpoint: GET https://real-time-product-search.p.rapidapi.com/search?q=<term>&country=us
+/** RapidAPI: Real Time Product Search → normalize from json.data[] or similar */
+async function rapidRPS({ query, limit, _debug = false }) {
+  if (!RAPIDAPI_ENABLED()) throw new Error('RapidAPI not configured');
+
   const url = new URL(`https://${RAPIDAPI_HOST}/search`);
   url.searchParams.set('q', query);
   url.searchParams.set('country', 'us');
+
+  if (_debug) console.log('[RPS] URL:', url.toString());
 
   const resp = await fetch(url.toString(), {
     method: 'GET',
@@ -163,25 +208,52 @@ async function rapidRPS({ query, limit }) {
       'X-RapidAPI-Host': RAPIDAPI_HOST
     }
   });
-  if (!resp.ok) throw new Error(`RapidAPI ${resp.status}: ${await resp.text().catch(()=>resp.statusText)}`);
 
-  const json = await resp.json();
-  const rows = Array.isArray(json?.data) ? json.data : [];
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`RapidAPI ${resp.status}: ${text}`);
+
+  let json = {};
+  try { json = JSON.parse(text); } catch {}
+  if (_debug) console.log('[RPS] root keys:', Object.keys(json || {}));
+
+  // Try multiple possible shapes
+  const arraysToTry = [
+    Array.isArray(json?.data) ? json.data : null,
+    Array.isArray(json?.data?.items) ? json.data.items : null,
+    Array.isArray(json?.data?.products) ? json.data.products : null,
+    Array.isArray(json?.results) ? json.results : null,
+    Array.isArray(json?.products) ? json.products : null,
+    Array.isArray(json?.items) ? json.items : null
+  ].filter(Boolean);
+
+  const rows = arraysToTry[0] || [];
+  if (_debug) {
+    console.log('[RPS] counts:', {
+      data: Array.isArray(json?.data) ? json.data.length : null,
+      data_items: Array.isArray(json?.data?.items) ? json.data.items.length : null,
+      data_products: Array.isArray(json?.data?.products) ? json.data.products.length : null,
+      results: Array.isArray(json?.results) ? json.results.length : null,
+      products: Array.isArray(json?.products) ? json.products.length : null,
+      items: Array.isArray(json?.items) ? json.items.length : null,
+      mapped: rows.length
+    });
+  }
 
   const items = rows.map((r) => {
-    const name   = r.product_title || r.title || r.name || 'Item';
-    const price  = parsePrice(r.product_price || r.price || '');
-    const link   = r.product_link || r.link || '#';
-    const image  = r.product_photo || r.image || r.thumbnail || 'https://via.placeholder.com/300';
-    const rating = r.product_rating || r.rating || '';
-    const store  = r.product_source || r.source || r.store || '';
+    const name   = r.product_title || r.title || r.name || r.heading || 'Item';
+    const price  = parsePrice(r.product_price || r.price || r.price_str || r.amount || '');
+    const link   = r.product_link || r.link || r.url || r.permalink || '#';
+    const image  = r.product_photo || r.image || r.thumbnail || r.imageUrl || 'https://via.placeholder.com/300';
+    const rating = r.product_rating || r.rating || r.stars || '';
+    const store  = r.product_source || r.source || r.store || r.seller || '';
     const reason = buildReason({ rating, merchant: store });
     return { name, price, link, image, reason, source: 'rapidapi:rps' };
   })
   .filter(i => isFinite(i.price) && i.link && i.name)
-  .sort((a,b)=>a.price-b.price)
+  .sort((a,b) => a.price - b.price)
   .slice(0, limit);
 
+  if (_debug) console.log('[RPS] mapped items:', items.length);
   return items;
 }
 
